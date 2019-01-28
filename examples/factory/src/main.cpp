@@ -6,20 +6,23 @@
 #include <aff3ct.hpp>
 
 constexpr float ebn0_min =  0.0f;
-constexpr float ebn0_max = 10.1f;
+constexpr float ebn0_max =  2.1f;
+constexpr float ebn0_step = 0.1f;
 
 int main(int argc, char** argv)
 {
 	using namespace aff3ct;
 	// declare the parameters objects
 	factory::Source          ::parameters p_src;
-	factory::Codec_repetition::parameters p_cdc;
+	factory::Codec_turbo     ::parameters p_cdc;
+	factory::CRC             ::parameters p_crc;
 	factory::Modem           ::parameters p_mdm;
 	factory::Channel         ::parameters p_chn;
 	factory::Monitor_BFER    ::parameters p_mnt;
 	factory::Terminal        ::parameters p_ter;
+	p_cdc.enable_puncturer();
 
-	std::vector<factory::Factory::parameters*> params = {&p_src, &p_cdc, &p_mdm, &p_chn, &p_mnt, &p_ter};
+	std::vector<factory::Factory::parameters*> params = {&p_src, &p_cdc, &p_mdm, &p_chn, &p_mnt, &p_ter, &p_crc};
 
 	factory::Command_parser cp(argc, argv, params, true);
 
@@ -49,8 +52,10 @@ int main(int argc, char** argv)
 	std::unique_ptr<module::Modem<>>            modem  (p_mdm.build());
 	std::unique_ptr<module::Channel<>>          channel(p_chn.build());
 	std::unique_ptr<module::Monitor_BFER<>>     monitor(p_mnt.build());
-	std::unique_ptr<module::Codec_repetition<>> codec  (p_cdc.build());
+	std::unique_ptr<module::Codec_turbo<>>      codec  (p_cdc.build());
+	std::unique_ptr<module::CRC<>>              crc    (p_crc.build());
 	auto& encoder = codec->get_encoder();
+	auto& pct     = codec->get_puncturer();
 	auto& decoder = codec->get_decoder_siho();
 
 	// create reporters to display results in terminal
@@ -66,7 +71,7 @@ int main(int argc, char** argv)
 	terminal->legend();
 
 	// configuration of the module tasks
-	std::vector<const module::Module*> modules{source.get(), encoder.get(), modem.get(), channel.get(), decoder.get(), monitor.get()};
+	std::vector<const module::Module*> modules{source.get(), encoder.get(), modem.get(), channel.get(), decoder.get(), monitor.get(), crc.get(), pct.get()};
 	for (auto& m : modules)
 		for (auto& t : m->tasks)
 		{
@@ -82,13 +87,17 @@ int main(int argc, char** argv)
 
 	// sockets binding (connect the sockets of the tasks = fill the input sockets with the output sockets)
 	using namespace module;
-	(*encoder)[enc::sck::encode      ::U_K ].bind((*source )[src::sck::generate   ::U_K ]);
-	(*modem  )[mdm::sck::modulate    ::X_N1].bind((*encoder)[enc::sck::encode     ::X_N ]);
+	(*crc    )[crc::sck::build       ::U_K1].bind((*source )[src::sck::generate   ::U_K ]);
+	(*encoder)[enc::sck::encode      ::U_K ].bind((*crc    )[crc::sck::build      ::U_K2]);
+	(*pct    )[pct::sck::puncture    ::X_N1].bind((*encoder)[enc::sck::encode     ::X_N ]);
+	(*modem  )[mdm::sck::modulate    ::X_N1].bind((*pct    )[pct::sck::puncture   ::X_N2 ]);
 	(*channel)[chn::sck::add_noise   ::X_N ].bind((*modem  )[mdm::sck::modulate   ::X_N2]);
 	(*modem  )[mdm::sck::demodulate  ::Y_N1].bind((*channel)[chn::sck::add_noise  ::Y_N ]);
-	(*decoder)[dec::sck::decode_siho ::Y_N ].bind((*modem  )[mdm::sck::demodulate ::Y_N2]);
-	(*monitor)[mnt::sck::check_errors::U   ].bind((*encoder)[enc::sck::encode     ::U_K ]);
-	(*monitor)[mnt::sck::check_errors::V   ].bind((*decoder)[dec::sck::decode_siho::V_K ]);
+	(*pct    )[pct::sck::depuncture  ::Y_N1].bind((*modem  )[mdm::sck::demodulate ::Y_N2]);
+	(*decoder)[dec::sck::decode_siho ::Y_N ].bind((*pct    )[pct::sck::depuncture ::Y_N2]);
+	(*crc    )[crc::sck::extract     ::V_K1].bind((*decoder)[dec::sck::decode_siho::V_K ]);
+	(*monitor)[mnt::sck::check_errors::U   ].bind((*source )[src::sck::generate   ::U_K ]);
+	(*monitor)[mnt::sck::check_errors::V   ].bind((*crc    )[crc::sck::extract    ::V_K2 ]);
 
 
 	// reset the memory of the decoder after the end of each communication
@@ -104,7 +113,7 @@ int main(int argc, char** argv)
 
 	// a loop over the various SNRs
 	const float R = (float)p_cdc.enc->K / (float)p_cdc.enc->N_cw; // compute the code rate
-	for (auto ebn0 = ebn0_min; ebn0 < ebn0_max; ebn0 += 1.f)
+	for (auto ebn0 = ebn0_min; ebn0 < ebn0_max; ebn0 += ebn0_step)
 	{
 		// compute the current sigma for the channel noise
 		const auto esn0  = tools::ebn0_to_esn0 (ebn0, R);
@@ -124,11 +133,15 @@ int main(int argc, char** argv)
 		while (!monitor->fe_limit_achieved() && !tools::Terminal::is_interrupt())
 		{
 			(*source )[src::tsk::generate    ].exec();
+			(*crc    )[crc::tsk::build       ].exec();
 			(*encoder)[enc::tsk::encode      ].exec();
+			(*pct    )[pct::tsk::puncture    ].exec();
 			(*modem  )[mdm::tsk::modulate    ].exec();
 			(*channel)[chn::tsk::add_noise   ].exec();
 			(*modem  )[mdm::tsk::demodulate  ].exec();
+			(*pct    )[pct::tsk::depuncture  ].exec();
 			(*decoder)[dec::tsk::decode_siho ].exec();
+			(*crc    )[crc::tsk::extract     ].exec();
 			(*monitor)[mnt::tsk::check_errors].exec();
 		}
 
